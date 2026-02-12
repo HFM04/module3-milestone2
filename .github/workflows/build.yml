@@ -1,9 +1,28 @@
+# CI/CD for "module3-milestone2" repo (root-based layout)
+#
+# Four pipeline stages (rubric):
+#  1) Test         -> run pytest to validate endpoint behavior + error handling
+#  2) Build        -> build the Docker image (ensures Dockerfile + build context work)
+#  3) Authenticate -> authenticate to Google Cloud using a GitHub Secret (service account JSON)
+#  4) Push         -> push image to Google Artifact Registry using semantic version tags
+#
+# Repo layout (from your screenshot):
+#   /app/...
+#   /Dockerfile
+#   /.github/workflows/build.yml
+#
+# GAR destination:
+#   us-central1-docker.pkg.dev/ml-deployment-486403/ml-repo/flower-service:<tag>
+
 name: CI-CD (Test, Build, Push to GAR)
 
 on:
+  # Run tests on PRs to main (quality gate)
   pull_request:
     branches: ["main"]
 
+  # Run tests + build on pushes to main
+  # Push image ONLY when a semantic tag is created (vX.Y.Z)
   push:
     branches: ["main"]
     tags:
@@ -17,6 +36,9 @@ env:
   IMAGE_NAME: "flower-service"
 
 jobs:
+  # ============================================================
+  # 1) TEST STAGE
+  # ============================================================
   test:
     name: Test (pytest)
     runs-on: ubuntu-latest
@@ -30,19 +52,23 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      # Install dependencies from our project folder.
-      # Using working-directory reduces long path errors.
+      # Install runtime deps for the FastAPI app + test tooling.
+      # NOTE: requirements.txt is inside /app in your repo.
       - name: Install dependencies (app + tests)
-        working-directory: module3-milestone2
         run: |
           python -m pip install --upgrade pip
           pip install -r app/requirements.txt
           pip install pytest httpx
 
+      # Run pytest from repo root.
+      # If you place tests in /tests, pytest will discover them automatically.
+      # If you place tests in /app/tests, pytest will also discover them.
       - name: Run unit tests
-        working-directory: module3-milestone2
         run: pytest -q
 
+  # ============================================================
+  # 2) BUILD STAGE (always after tests)
+  # ============================================================
   build:
     name: Build Docker image (validation)
     runs-on: ubuntu-latest
@@ -52,14 +78,19 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # Build using the Dockerfile at repo root.
+      # push=false because we only push on semantic version tags.
       - name: Build image (no push)
         uses: docker/build-push-action@v6
         with:
-          context: module3-milestone2
-          file: module3-milestone2/Dockerfile
+          context: .
+          file: ./Dockerfile
           push: false
           tags: local/${{ env.IMAGE_NAME }}:ci
 
+  # ============================================================
+  # 3) AUTH + 4) PUSH (semantic tags only)
+  # ============================================================
   publish:
     name: Authenticate + Push to GAR (tags only)
     runs-on: ubuntu-latest
@@ -70,25 +101,30 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # Authenticate using your service account JSON stored as GitHub Secret GCP_SA_KEY.
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
+      # Install gcloud CLI so we can configure Docker auth to Artifact Registry.
       - name: Set up gcloud SDK
         uses: google-github-actions/setup-gcloud@v2
 
+      # Configure Docker credential helper for GAR in us-central1.
       - name: Configure Docker for Artifact Registry
         run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
 
+      # Extract the tag name (example: v1.0.0) from the GitHub ref.
       - name: Extract semantic version tag
         id: version
         run: echo "TAG=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
 
+      # Build and push to GAR using the semantic tag.
       - name: Build and push image to GAR
         run: |
           IMAGE_URI=${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.TAG }}
           echo "Pushing: $IMAGE_URI"
 
-          docker build -t "$IMAGE_URI" module3-milestone2
+          docker build -t "$IMAGE_URI" .
           docker push "$IMAGE_URI"
