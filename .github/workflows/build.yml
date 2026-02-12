@@ -1,0 +1,160 @@
+# CI/CD Workflow for Milestone 2 (Containerization + CI/CD)
+#
+# Pipeline stages (matches course expectation):
+#  1) Test         -> run pytest to validate API behavior and error handling
+#  2) Build        -> build the Docker image (verifies Dockerfile works)
+#  3) Authenticate -> log in to the container registry using GitHub Secrets
+#  4) Push         -> push the image with a semantic version tag (vX.Y.Z)
+#
+# Design choices:
+# - We ALWAYS run tests on PRs and main branch pushes.
+# - We ONLY authenticate + push when the Git ref is a version tag: v*.*.*
+#   This prevents accidental publishing on every commit.
+# - Paths are explicitly set for our repo structure: module3/milestone2/...
+
+name: CI-CD (Test, Build, Push)
+
+on:
+  # Runs on:
+  # - Pull requests to main: tests + docker build validation (no pushing)
+  pull_request:
+    branches: ["main"]
+
+  # - Pushes to main: tests + docker build validation (no pushing)
+  push:
+    branches: ["main"]
+
+    # - Semantic version tags: tests + build + auth + push
+    #   Example: v1.0.0, v0.2.3
+    tags:
+      - "v*.*.*"
+
+# Global environment variables used by multiple jobs.
+# Keeps the workflow DRY and easier to update.
+env:
+  PYTHON_VERSION: "3.11"
+
+  # Image naming (registry host and namespace come from secrets because
+  # they are course-specific and sometimes contain project IDs).
+  IMAGE_NAME: flower-service
+
+jobs:
+  # ============================================================
+  # 1) TEST STAGE
+  # ============================================================
+  test:
+    name: Test (pytest)
+    runs-on: ubuntu-latest
+
+    steps:
+      # Step 1: Pull down your repository so the runner has your code.
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Step 2: Install Python so we can run unit tests.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      # Step 3: Install dependencies required to run the API tests.
+      # We install the service deps (requirements.txt) + testing deps.
+      #
+      # Notes:
+      # - httpx is required by FastAPI TestClient in modern stacks.
+      # - If you add more test helpers later, add them here or in a dev requirements file.
+      - name: Install dependencies (app + test)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r module3/milestone2/app/requirements.txt
+          pip install pytest httpx
+
+      # Step 4: Run tests from the milestone2 directory so imports resolve correctly.
+      #
+      # Why working-directory matters:
+      # - Our tests import: from app.app import app
+      # - Running pytest from module3/milestone2 makes "app/" resolvable as a local module.
+      - name: Run unit tests
+        working-directory: module3/milestone2
+        run: pytest -q
+
+  # ============================================================
+  # 2) BUILD + 3) AUTH + 4) PUSH STAGES (combined job)
+  # ============================================================
+  build_and_push:
+    name: Build + Authenticate + Push (Docker)
+    runs-on: ubuntu-latest
+
+    # This enforces the pipeline order:
+    # build/push only happens if tests pass.
+    needs: test
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ---------------------------
+      # BUILD (always)
+      # ---------------------------
+      # We always build the image (even on PRs and branch pushes) to confirm:
+      # - Dockerfile is valid
+      # - Multi-stage build works
+      # - Model artifact is present in the build context
+      #
+      # However, we DO NOT push unless this is a version tag event.
+      - name: Build Docker image (validation build)
+        uses: docker/build-push-action@v6
+        with:
+          context: module3/milestone2
+          file: module3/milestone2/Dockerfile
+          push: false
+          tags: local/${{ env.IMAGE_NAME }}:ci
+
+      # ---------------------------
+      # AUTHENTICATE (tags only)
+      # ---------------------------
+      # We only authenticate to the registry when we intend to push.
+      # This reduces exposure and avoids failing PR builds due to missing secrets.
+      #
+      # Secrets required (GitHub repo settings → Secrets and variables → Actions):
+      # - REGISTRY_HOST       (example: us-central1-docker.pkg.dev)
+      # - REGISTRY_USERNAME   (registry-specific; for GAR often "_json_key" or "oauth2accesstoken")
+      # - REGISTRY_PASSWORD   (token or JSON key content depending on course setup)
+      # - REGISTRY_NAMESPACE  (example: <gcp-project>/<artifact-repo>/<student-namespace>)
+      - name: Login to container registry
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.REGISTRY_HOST }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      # ---------------------------
+      # VERSION TAG EXTRACTION (tags only)
+      # ---------------------------
+      # Extract the Git tag (like v1.0.0) so we can tag the Docker image consistently.
+      - name: Extract semantic version tag
+        if: startsWith(github.ref, 'refs/tags/')
+        id: version
+        run: |
+          echo "TAG=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+
+      # ---------------------------
+      # PUSH (tags only)
+      # ---------------------------
+      # Build and push the image to the registry with the semantic version tag.
+      #
+      # Example resulting image reference:
+      #   us-central1-docker.pkg.dev/<namespace>/flower-service:v1.0.0
+      #
+      # If you also want a "latest" tag, you can add it, but many courses prefer
+      # only semantic version tags for traceability.
+      - name: Build and push Docker image (semantic version tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: docker/build-push-action@v6
+        with:
+          context: module3/milestone2
+          file: module3/milestone2/Dockerfile
+          push: true
+          tags: |
+            ${{ secrets.REGISTRY_HOST }}/${{ secrets.REGISTRY_NAMESPACE }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.TAG }}
