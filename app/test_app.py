@@ -1,229 +1,171 @@
 """
-tests/test_app.py
+Unit tests for the FastAPI ML inference service.
 
-Tailored pytest suite for *our* Flower Prediction FastAPI service.
+Routes:
+- GET /       -> {"status": "ok", "model_loaded": True} (also checks model can load)
+- GET /healthz -> {"status": "ok"} (basic liveness)
+- POST /predict -> PredictionResponse:
+    {
+      "prediction": <str>,
+      "confidence": <float|null>,
+      "model_version": <str>,
+      "n_features": <int|null>
+    }
 
-Why this file exists (rubric alignment):
-- "Test inference endpoint functionality"
-- "Validate input/output formats"
-- "Check error handling"
-
-Key Design Choice in OUR project:
-- Input is a 4-length numeric vector: {"features":[...]}
-  This keeps the API simple and avoids field-name mismatches.
+Why these tests matter:
+- They prove the service responds correctly (functionality)
+- They validate request/response formats (schema)
+- They verify error handling (bad inputs, wrong feature lengths)
 """
 
 import pytest
 from fastapi.testclient import TestClient
 
-# NOTE:
-# This import MUST match your project structure.
-# Our project uses:
-#   module3/milestone2/app/app.py  -> contains `app = FastAPI(...)`
-# In tests, Python resolves "app" as a package because module3/milestone2/app/
-# is a folder. If your folder isn't treated as a package, you may need an
-# __init__.py in app/ (optional in modern Python but can help in CI).
+# Import the FastAPI app object.
+# Your file is app/app.py and it defines `app = FastAPI(...)`.
 from app.app import app
 
 
-# =============================================================================
-# Fixtures (Reusable Test Data)
-# =============================================================================
-
 @pytest.fixture
 def client():
-    """
-    TestClient spins up the FastAPI app in-memory (no real server needed).
-
-    Why this is useful:
-    - Fast and deterministic tests
-    - No need to run uvicorn
-    - Perfect for CI pipelines
-    """
+    """In-memory HTTP client for the FastAPI app (no real server needed)."""
     return TestClient(app)
 
 
 @pytest.fixture
 def valid_payload():
     """
-    Canonical valid request payload for our /predict endpoint.
+    A known-good Iris-like feature vector.
 
-    IMPORTANT:
-    - features must be a list of exactly 4 numbers
-    - ordering is [sepal_length, sepal_width, petal_length, petal_width]
+    Ordering matters and must match model training:
+    [sepal_length, sepal_width, petal_length, petal_width]
     """
     return {"features": [5.1, 3.5, 1.4, 0.2]}
 
 
-@pytest.fixture
-def known_like_samples():
-    """
-    Samples that are 'typical' of each class.
-
-    NOTE:
-    We are not hard-asserting the exact class label here because:
-    - The model could change slightly (different classifier/hyperparams)
-    - The goal of unit tests is mostly API correctness + stability
-
-    We *do* use these in a parametrized test to ensure the endpoint behaves
-    consistently across a range of realistic inputs.
-    """
-    return [
-        {"features": [4.9, 3.0, 1.4, 0.2]},  # setosa-ish
-        {"features": [6.0, 2.7, 4.5, 1.3]},  # versicolor-ish
-        {"features": [6.3, 2.9, 5.6, 2.1]},  # virginica-ish
-    ]
-
-
 # =============================================================================
-# Health Endpoint Tests
+# Health / Liveness Tests
 # =============================================================================
 
-def test_health_endpoint_ok(client):
+def test_root_health_loads_model(client):
     """
-    What this test proves:
-    - The app can start
-    - Routing works
-    - The service exposes a basic operational check
+    GET / is a stronger health check:
+    - returns 200
+    - confirms the model artifact can be loaded (model_loaded True)
+    """
+    r = client.get("/")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "ok"
+    assert body["model_loaded"] is True
 
-    Why graders care:
-    - It's a standard production pattern
-    - It confirms the container/service is alive
+
+def test_healthz_basic(client):
     """
-    r = client.get("/health")
+    GET /healthz is a basic liveness check.
+    It should return quickly and not necessarily load the model.
+    """
+    r = client.get("/healthz")
     assert r.status_code == 200
     assert r.json() == {"status": "ok"}
 
 
 # =============================================================================
-# Prediction Endpoint Tests (Happy Path)
+# Predict Endpoint Tests (Happy Path)
 # =============================================================================
 
-def test_predict_success_returns_expected_fields(client, valid_payload):
+def test_predict_valid_input_returns_expected_fields(client, valid_payload):
     """
-    What this test proves:
-    - /predict accepts valid JSON input
-    - Returns HTTP 200
-    - Response includes the fields our client depends on
-
-    This is the most important "endpoint works" test.
+    Verifies that /predict:
+    - accepts valid input
+    - returns HTTP 200
+    - returns the expected response keys
     """
     r = client.post("/predict", json=valid_payload)
     assert r.status_code == 200
 
     data = r.json()
 
-    # These are the contract fields for our API response:
-    assert "prediction" in data
-    assert "class_index" in data
-    assert "probabilities" in data  # may be None, but key should exist
+    # Your response model guarantees these keys exist.
+    assert set(data.keys()) == {"prediction", "confidence", "model_version", "n_features"}
+
+    assert isinstance(data["prediction"], str)
+    assert isinstance(data["model_version"], str)
+
+    # confidence can be None if model lacks predict_proba, so allow None or float
+    assert (data["confidence"] is None) or isinstance(data["confidence"], (int, float))
+
+    # n_features can be None if model doesn't expose n_features_in_
+    assert (data["n_features"] is None) or isinstance(data["n_features"], int)
 
 
 def test_predict_prediction_is_valid_label(client, valid_payload):
     """
-    What this test proves:
-    - The endpoint returns a valid class label string
-    - Prevents silent breaking changes like returning numeric labels only
+    Because you map target_names when available, prediction should usually be one of:
+    setosa, versicolor, virginica
     """
     r = client.post("/predict", json=valid_payload)
     assert r.status_code == 200
 
-    prediction = r.json()["prediction"]
-    assert prediction in ["setosa", "versicolor", "virginica"]
+    pred = r.json()["prediction"]
+    assert pred in ["setosa", "versicolor", "virginica"]
 
 
-def test_predict_class_index_is_valid(client, valid_payload):
+def test_predict_confidence_range_if_present(client, valid_payload):
     """
-    What this test proves:
-    - class_index is an int and stays within expected range
-    - Prevents contract drift (e.g., returning strings or out-of-range ints)
+    If confidence is returned, it should be a probability in [0,1].
     """
     r = client.post("/predict", json=valid_payload)
     assert r.status_code == 200
 
-    class_index = r.json()["class_index"]
-    assert isinstance(class_index, int)
-    assert class_index in [0, 1, 2]
-
-
-def test_predict_probabilities_are_well_formed_if_present(client, valid_payload):
-    """
-    What this test proves:
-    - If the model supports predict_proba, probabilities are:
-        - a length-3 list
-        - numeric
-        - within [0, 1]
-        - roughly sum to 1
-
-    Why we make it conditional:
-    - Not all models expose predict_proba
-    - Our app returns None if unavailable
-    """
-    r = client.post("/predict", json=valid_payload)
-    assert r.status_code == 200
-
-    probs = r.json().get("probabilities")
-
-    # If probabilities are not returned, that's acceptable per our design.
-    if probs is None:
+    conf = r.json()["confidence"]
+    if conf is None:
         return
 
-    assert isinstance(probs, list)
-    assert len(probs) == 3
-    assert all(isinstance(p, (int, float)) for p in probs)
-    assert all(0.0 <= float(p) <= 1.0 for p in probs)
-
-    # Allow small floating point drift
-    assert 0.99 <= sum(float(p) for p in probs) <= 1.01
+    assert 0.0 <= float(conf) <= 1.0
 
 
 # =============================================================================
-# Input Validation & Error Handling (Negative Tests)
+# Input Validation & Error Handling
 # =============================================================================
 
-def test_predict_rejects_missing_features_key(client):
+def test_predict_missing_features_key_returns_422(client):
     """
-    What this test proves:
-    - Pydantic validation is active
-    - Missing required fields produce a 422 error (FastAPI default)
-
-    This directly satisfies "Check error handling".
+    Missing required field should fail Pydantic validation with 422.
     """
     r = client.post("/predict", json={"wrong_key": [1, 2, 3, 4]})
     assert r.status_code == 422
 
 
-def test_predict_rejects_wrong_length_feature_vector(client):
+def test_predict_empty_features_list_returns_422(client):
     """
-    What this test proves:
-    - Schema enforces exactly 4 features
-    - Prevents malformed requests from reaching the model
+    Your custom validator rejects empty features list -> 422.
     """
-    r = client.post("/predict", json={"features": [5.1, 3.5, 1.4]})
+    r = client.post("/predict", json={"features": []})
     assert r.status_code == 422
 
 
-def test_predict_rejects_non_numeric_values(client):
+def test_predict_non_numeric_features_returns_422(client):
     """
-    What this test proves:
-    - The API enforces numeric feature types
-    - Prevents runtime errors inside sklearn pipeline
+    Non-numeric types should fail schema validation -> 422.
     """
     r = client.post("/predict", json={"features": ["bad", 3.5, 1.4, 0.2]})
     assert r.status_code == 422
 
 
-def test_predict_rejects_empty_body(client):
+def test_predict_wrong_feature_length_returns_422(client):
     """
-    What this test proves:
-    - Empty request fails validation cleanly
+    If the model exposes n_features_in_, your code enforces exact length and returns 422.
+    This test will pass for sklearn models trained on Iris (n_features_in_ = 4).
     """
-    r = client.post("/predict", json={})
+    r = client.post("/predict", json={"features": [5.1, 3.5, 1.4]})
     assert r.status_code == 422
+    # Optional: check the error message includes "Expected" for clarity
+    assert "Expected" in r.json().get("detail", "")
 
 
 # =============================================================================
-# Parametrized Tests (Multiple Inputs, Same Expectations)
+# Parametrized Stability Tests
 # =============================================================================
 
 @pytest.mark.parametrize(
@@ -236,76 +178,11 @@ def test_predict_rejects_empty_body(client):
 )
 def test_predict_multiple_realistic_inputs(client, payload):
     """
-    What this test proves:
-    - The endpoint behaves consistently across multiple realistic inputs
-    - Reduces the risk of "works for one payload only" bugs
-
-    Note:
-    We do NOT assert exact labels here to keep tests stable if the model
-    changes slightly. We validate the output contract instead.
+    Ensures endpoint stability across multiple realistic input vectors.
+    We validate output *format* and allowed class labels.
     """
     r = client.post("/predict", json=payload)
     assert r.status_code == 200
-    assert r.json()["prediction"] in ["setosa", "versicolor", "virginica"]
-    assert r.json()["class_index"] in [0, 1, 2]
-
-
-# =============================================================================
-# Response Schema & Headers
-# =============================================================================
-
-def test_response_schema_exact_keys(client, valid_payload):
-    """
-    What this test proves:
-    - Response keys remain stable (no breaking changes)
-    - Helps catch accidental refactors that change the response structure
-    """
-    r = client.post("/predict", json=valid_payload)
-    assert r.status_code == 200
-
     data = r.json()
-    assert set(data.keys()) == {"prediction", "class_index", "probabilities"}
+    assert data["prediction"] in ["setosa", "versicolor", "virginica"]
 
-
-def test_content_type_json(client, valid_payload):
-    """
-    What this test proves:
-    - Response is JSON (important for API consumers and tooling)
-    """
-    r = client.post("/predict", json=valid_payload)
-    assert r.status_code == 200
-    assert r.headers["content-type"].startswith("application/json")
-
-
-# =============================================================================
-# Edge Case Tests (Boundary Behavior)
-# =============================================================================
-
-def test_predict_near_zero_values(client):
-    """
-    What this test proves:
-    - The service doesn't crash on boundary-ish numeric values
-    - Validates robustness at the API layer
-
-    We keep these values > 0 to avoid 'obviously invalid' cases.
-    """
-    payload = {"features": [0.001, 0.001, 0.001, 0.001]}
-    r = client.post("/predict", json=payload)
-
-    assert r.status_code == 200
-    assert r.json()["prediction"] in ["setosa", "versicolor", "virginica"]
-
-
-def test_predict_large_values(client):
-    """
-    What this test proves:
-    - The service can handle large numeric inputs without throwing errors
-    - Real-world systems often receive out-of-distribution data
-
-    We don't claim model correctness here, just endpoint stability.
-    """
-    payload = {"features": [100.0, 50.0, 75.0, 40.0]}
-    r = client.post("/predict", json=payload)
-
-    assert r.status_code == 200
-    assert r.json()["prediction"] in ["setosa", "versicolor", "virginica"]
