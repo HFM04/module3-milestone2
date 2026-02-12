@@ -94,17 +94,7 @@ This project demonstrates:
 ├── docker-compose.yml
 ├── RUNBOOK.md
 └── README.md
-
-
-GitHub renders that as literal code.
-
----
-
-### ✅ What you actually want in README.md
-
-Just this — no outer code fence:
-
----
+```
 
 ## API Endpoints
 
