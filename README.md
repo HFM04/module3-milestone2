@@ -296,11 +296,4 @@ Ensure service account has `Artifact Registry Writer`.
 
 ---
 
-### Bottom Line
 
-For a README file:
-- ❌ Do NOT wrap the whole file in triple backticks.
-- ✅ Only use backticks for commands and code blocks.
-- ✅ Let headings render naturally.
-
-If you want, I can now give you the **entire final README cleanly formatted exactly as it should appear in GitHub** (fully polished, production-ready).
