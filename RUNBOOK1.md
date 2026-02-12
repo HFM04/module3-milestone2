@@ -1,4 +1,4 @@
-```markdown
+
 # ML Inference Service – Operational Runbook
 
 ## 1. Purpose
@@ -389,4 +389,4 @@ This runbook ensures the service is:
 - Recoverable  
 - Reproducible  
 - Production-ready  
-```
+
